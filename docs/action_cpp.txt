@@ -1,0 +1,562 @@
+#include <lvgl.h>
+#include "ui.h"
+#include "actions.h"
+#include "beep.h"
+#include "screens.h"
+#include "images.h"
+#include "serial.h"
+#include "common.h"
+
+extern app_action_handle_t app_action_handle;
+extern volatile unsigned long  idle_time_s;
+extern app_callback_t *callbackmain;
+
+type_apply_timer_t timer_copy_cache;//Dữ liệu copy timer
+
+static void _callback(app_action_handle_t handle, int event_id, void *data, int len)
+{
+    if (handle->callback != NULL)
+    {
+        handle->callback(event_id, data, len);
+    }
+}
+
+void action_call_checklogin(lv_event_t *e)
+{
+    // Lấy text người dùng nhập
+    const char *entered_pass = lv_textarea_get_text(objects.txt_login);
+
+    // So sánh với mật khẩu đúng
+    if (strcmp(entered_pass, "13579") == 0)
+    {
+        // Nếu đúng: chuyển sang màn hình chính và xóa mật khẩu
+        lv_scr_load(objects.mainpage);
+        ; // hoặc gọi ui_init_mainpage_1() nếu bật Screens Lifetime Support
+    }
+    else
+    {
+        // Nếu sai: hiện thông báo lỗi, phát tiếng beep, và xóa mật khẩu
+        lv_textarea_set_text(objects.txt_console, "Nhập sai mật khẩu,  vui lòng nhập lại mật khẩu đúng để sử dụng");
+        beep_error_trigger(); // Hàm phát tiếng beep
+
+    }
+        lv_textarea_set_text(objects.txt_login, "");
+}
+
+void action_beep_callback(lv_event_t *e)
+{
+    beep_trigger(3000, 0.1f); // Phát tiếng beep với tần số 3000Hz trong 0.1 giây
+}
+
+void action_gps_run_get_local(lv_event_t *e) {
+    printf("GPS run get local\n");
+    _callback(app_action_handle, 1002, NULL, 0);
+}
+
+void action_save_date_time(lv_event_t *e)
+ {
+    const char *text_hour = lv_textarea_get_text(objects.rtc_hour);
+    const char *text_minute = lv_textarea_get_text(objects.rtc_min);
+    const char *text_second = lv_textarea_get_text(objects.rtc_sec);
+
+    const char *text_year = lv_textarea_get_text(objects.rtc_year);
+    const char *text_month = lv_textarea_get_text(objects.rtc_month);
+    const char *text_date = lv_textarea_get_text(objects.rtc_date);
+    type_setting_rtc_t temp_rtc;
+    temp_rtc.rtc_time.hour = atoi(text_hour);
+    temp_rtc.rtc_time.minute = atoi(text_minute);
+    temp_rtc.rtc_time.second = atoi(text_second);
+    temp_rtc.rtc_time.year = atoi(text_year);
+    temp_rtc.rtc_time.month = atoi(text_month);
+    temp_rtc.rtc_time.date = atoi(text_date);  
+    temp_rtc.gps_auto_run = lv_obj_has_state(objects.choise_gpsauto_run,LV_STATE_CHECKED)?true:false;      
+    _callback(app_action_handle, 1001,(uint8_t *)&temp_rtc, sizeof(type_setting_rtc_t));
+ }
+void action_change_index_timer(lv_event_t *e) {}
+void action_save_dim_5_lever(lv_event_t *e) {}
+void action_turn_on_screen(lv_event_t *e) 
+{
+    idle_time_s = 0; // Reset idle time
+}
+
+#pragma region DIEU KHIEN TAT MO CONTACTOR
+void action_ev_manual_change(lv_event_t * e)
+{
+    uint8_t val = 0;
+    if(lv_obj_has_state(objects.sw_maunual, LV_STATE_CHECKED)) 
+    {
+        val = 1; // Enable manual control
+    }
+    else
+    {
+        val = 0; // Disable manual control
+    }
+    _callback(app_action_handle, MSP_SWICH_MANUAL_CONTROL, &val, sizeof(val));
+}
+
+void action_on_phase_a(lv_event_t *e)
+{
+    printf("Phase A turned ON\n");
+    uint8_t val = 0x01;
+    lv_obj_set_style_arc_color(objects.spin_oa, lv_color_hex(0x70ec0b), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN1_CONTACTOR, &val, sizeof(val));
+}
+
+void action_off_phase_a(lv_event_t *e)
+{
+    printf("Phase A turned OFF\n");
+    uint8_t val = 0x00;
+        // Add logic to turn off Phase A
+    lv_obj_set_style_arc_color(objects.spin_oa, lv_color_hex(0x515355), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN1_CONTACTOR, &val, sizeof(val));
+}
+
+void action_on_phase_b(lv_event_t *e)
+{
+    printf("Phase B turned ON\n");
+    uint8_t val = 0x01;
+    lv_obj_set_style_arc_color(objects.spin_ob, lv_color_hex(0x70ec0b), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN2_CONTACTOR, &val, sizeof(val));
+}
+
+void action_off_phase_b(lv_event_t *e)
+{
+    printf("Phase B turned OFF\n");
+    uint8_t val = 0x00;
+    lv_obj_set_style_arc_color(objects.spin_ob, lv_color_hex(0x515355), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN2_CONTACTOR, &val, sizeof(val));
+}
+
+void action_on_phase_c(lv_event_t *e)
+{
+    printf("Phase C turned ON\n");
+    uint8_t val = 0x01;
+    lv_obj_set_style_arc_color(objects.spin_oc, lv_color_hex(0x70ec0b), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN3_CONTACTOR, &val, sizeof(val));
+}
+
+void action_off_phase_c(lv_event_t *e)
+{
+    printf("Phase C turned OFF\n");
+    uint8_t val = 0x00;
+    // Add logic to turn off Phase C
+    lv_obj_set_style_arc_color(objects.spin_oc, lv_color_hex(0x515355), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    _callback(app_action_handle, MSP_PIN3_CONTACTOR, &val, sizeof(val));
+}
+#pragma endregion
+
+
+void action_ev_chage_mode_timer(lv_event_t *e) {}
+void action_ev_change_mode_sun(lv_event_t *e) {}
+void action_ev_enable_wifi_chage(lv_event_t *e) {}
+void action_ev_connect_to_wifi(lv_event_t *e) {}
+void action_sw_cloud_enable(lv_event_t *e) {}
+void action_ev_save_com_port(lv_event_t *e)
+{
+      type_device_config_t temp;
+    if(lv_obj_has_state(objects.sw_en_io, LV_STATE_CHECKED)) 
+    {
+        temp.input[0] = 1; // Enable input
+    }
+    else
+    {
+        temp.input[0] = 0; // Disable input
+    }
+
+    if(lv_obj_has_state(objects.sw_en_am, LV_STATE_CHECKED)) 
+    {
+        temp.input[1] = 1; // Enable input
+    }
+    else
+    {
+        temp.input[1] = 0; // Disable input
+    }
+
+    if(lv_obj_has_state(objects.sw_en_ouput_a, LV_STATE_CHECKED)) 
+    {
+        temp.output[0] = 1; // Enable output A
+    }
+    else
+    {
+        temp.output[0] = 0; // Disable output A
+    }
+
+    if(lv_obj_has_state(objects.sw_en_ouput_b, LV_STATE_CHECKED)) 
+    {
+        temp.output[1] = 1; // Enable output B
+    }
+    else
+    {
+        temp.output[1] = 0; // Disable output B
+    }
+
+    if(lv_obj_has_state(objects.sw_en_ouput_c, LV_STATE_CHECKED)) 
+    {
+        temp.output[2] = 1; // Enable output C
+    }
+    else
+    {
+        temp.output[2] = 0; // Disable output C
+    }
+
+    if(lv_obj_has_state(objects.sw_modbus_enable, LV_STATE_CHECKED)) 
+    {
+        const char *text_type_modbus = lv_textarea_get_text(objects.txttypemodbus);
+        if(strcmp(text_type_modbus, "MFM383A") == 0)
+        {
+            temp.modbus_model = 1; // MFM383A
+        }
+        else if(strcmp(text_type_modbus, "MFM300") == 0)
+        {
+            temp.modbus_model = 2; // MFM300
+        }
+        else
+        {
+            temp.modbus_model = 0; // None
+        }
+        const char *text_baud_modbus = lv_textarea_get_text(objects.txtbaudmodbus);
+        temp.modbus_baudrate = atoi(text_baud_modbus); // Set baud rate
+        const char *text_add_modbus = lv_textarea_get_text(objects.txtaddmodbus);
+        temp.modbus_Slave_add = atoi(text_add_modbus); // Set slave address
+    }
+    else
+    {
+        temp.modbus_model = 0; // Disable Modbus
+    }
+    printf("COM port settings:\n");
+    _callback(app_action_handle, 1003, (uint8_t*)&temp, sizeof(type_device_config_t));
+  
+}
+void action_ev_active_device(lv_event_t *e) 
+{
+   _callback(app_action_handle, MSP_DEVICE_ACTIVE, NULL, 0); // Activate device 
+}
+void action_ev_gps_pause_update(lv_event_t *e)
+{
+     uint8_t pause_gps = 0;
+    if (lv_obj_has_state(objects.choise_pause_gps, LV_STATE_CHECKED)) 
+    {
+        pause_gps = 1; // Pause GPS
+    }
+    else
+    {
+        pause_gps = 0; // Resume GPS
+    }
+    _callback(app_action_handle, 1004, &pause_gps, sizeof(pause_gps));
+}
+void action_ev_wifi_connect(lv_event_t *e) 
+{
+       // Add logic to handle WiFi connection
+    const char *text_ssid= lv_textarea_get_text(objects.txt_ssid);
+    const char *text_password = lv_textarea_get_text(objects.txtpassword);
+    if(strlen(text_ssid) == 0 || strlen(text_password) == 0)
+    {
+        printf("SSID or Password is empty!\r\n");
+        return;
+    }
+    type_wifi_info_t wifi_info;
+    snprintf(wifi_info.ssid, sizeof(wifi_info.ssid), "%s", text_ssid);
+    snprintf(wifi_info.password, sizeof(wifi_info.password), "%s", text_password);
+    _callback(app_action_handle, 1005, (uint8_t*)&wifi_info, sizeof(type_wifi_info_t));
+}
+
+
+
+void action_toggle_eye_text(lv_event_t *e)
+ {
+      const char *text = lv_label_get_text(objects.lb_show_hide);
+    if(strcmp(text, LV_SYMBOL_EYE_CLOSE) == 0)
+    {
+        lv_textarea_set_password_mode(objects.txtpassword, false);
+        lv_label_set_text(objects.lb_show_hide, LV_SYMBOL_EYE_OPEN); 
+    }else
+    {
+        lv_textarea_set_password_mode(objects.txtpassword, true);
+        lv_label_set_text(objects.lb_show_hide, LV_SYMBOL_EYE_CLOSE); 
+    }  
+ }
+ #pragma region XỬ LÝ CÁC TIMER CÀI ĐẶT CHIẾN LƯỢC ĐÓNG CẮT
+
+
+void action_ev_change_pin1(lv_event_t *e)
+ {
+    type_timer_index_t timer_index;
+    timer_index.idx_pin = 0;    
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    timer_index.idx_timer = atoi(text_index_timer);
+    if(timer_index.idx_timer > 0 && timer_index.idx_timer < 49)
+    {
+        timer_index.idx_timer = timer_index.idx_timer - 1;
+        _callback(app_action_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+    } 
+ }
+void action_ev_change_pin2(lv_event_t *e) 
+{
+    type_timer_index_t timer_index;
+    timer_index.idx_pin = 1;    
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    timer_index.idx_timer = atoi(text_index_timer);
+    if(timer_index.idx_timer > 0 && timer_index.idx_timer < 49)
+    {
+        timer_index.idx_timer = timer_index.idx_timer - 1;
+        _callback(app_action_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+    } 
+}
+void action_ev_change_pin3(lv_event_t *e)
+{
+    type_timer_index_t timer_index;
+    timer_index.idx_pin = 2;    
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    timer_index.idx_timer = atoi(text_index_timer);
+    if(timer_index.idx_timer > 0 && timer_index.idx_timer < 49)
+    {
+        timer_index.idx_timer = timer_index.idx_timer - 1;
+        _callback(app_action_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+    } 
+}
+
+
+
+
+
+void parse_special_day_string_to_struct(const char *input, type_one_timer_contactors_t *t)
+{
+    // Đảm bảo tất cả phần tử rỗng ban đầu
+    for (uint8_t i = 0; i < MAX_NUM_SPECIAL_DAY; i++) {
+        t->special_day[i].date = 0;
+        t->special_day[i].month = 0;
+    }
+
+    if (input == nullptr || strlen(input) == 0) return;
+
+    char buffer[128];
+    strncpy(buffer, input, sizeof(buffer));
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    uint8_t idx = 0;
+
+    char *token = strtok(buffer, ";");
+    while (token && idx < MAX_NUM_SPECIAL_DAY) {
+        int d = 0, m = 0;
+        if (sscanf(token, "%d/%d", &d, &m) == 2) {
+            t->special_day[idx].date = d;
+            t->special_day[idx].month = m;
+            idx++;
+        }
+        token = strtok(nullptr, ";");
+    }
+}
+
+
+void action_ev_inc_timer(lv_event_t * e)
+{
+    //Serial.println("Change index timer");
+    type_timer_index_t timer_index;
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    timer_index.idx_timer = atoi(text_index_timer);
+    timer_index.idx_timer++;
+    if(timer_index.idx_timer > 48)
+    {
+        timer_index.idx_timer = 1;
+    }
+    char text[4];
+    snprintf(text, sizeof(text), "%02d", timer_index.idx_timer);
+    lv_label_set_text(objects.lbcnt_timer, text);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    timer_index.idx_pin = atoi(text_index_pin);
+    if(timer_index.idx_pin > 0 && timer_index.idx_pin < 4)
+    {
+        timer_index.idx_timer = timer_index.idx_timer - 1;
+        timer_index.idx_pin = timer_index.idx_pin - 1;
+        _callback(app_action_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+        printf("Change timer index: %d\n", timer_index.idx_timer);
+        
+    }
+}
+void action_ev_dec_timer(lv_event_t * e)
+{
+    //Serial.println("Change index timer");
+    type_timer_index_t timer_index;
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    timer_index.idx_timer = atoi(text_index_timer);
+    if(timer_index.idx_timer > 0 && timer_index.idx_timer < 49)
+    {
+        timer_index.idx_timer--;
+    }
+    if(timer_index.idx_timer == 0)
+    {
+        timer_index.idx_timer = 48;
+    }
+    char text[4];
+    snprintf(text, sizeof(text), "%02d", timer_index.idx_timer);
+    lv_label_set_text(objects.lbcnt_timer, text);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    timer_index.idx_pin = atoi(text_index_pin);
+    if(timer_index.idx_pin > 0 && timer_index.idx_pin < 4)
+    {
+        timer_index.idx_timer = timer_index.idx_timer - 1;
+        timer_index.idx_pin = timer_index.idx_pin - 1;
+        _callback(app_action_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+    }
+}
+
+void action_ev_clear_timer(lv_event_t *e) 
+{
+        //Lấy chỉ số timer cần xóa và truyền về CPU chính
+
+    // Add logic to clear the timer
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    uint8_t index_timer = atoi(text_index_timer);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    uint8_t idx_pin = atoi(text_index_pin);
+
+    //Gửi lệnh clear timer
+    type_timer_index_t timer_index;
+    if (index_timer > 0 && index_timer < 49)
+    {
+        if(idx_pin > 0 && idx_pin < 4)
+        {
+            timer_index.idx_pin = idx_pin - 1;
+            timer_index.idx_timer = index_timer - 1;
+            //hmi.send_struct(MSP_TIMER_CLEAR, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+            //Serial.println("Clear timer action triggered");
+            _callback(app_action_handle, MSP_TIMER_CLEAR, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+        }
+    }
+}
+void action_ev_copy_timer(lv_event_t *e)
+ {
+        //Đọc toàn bộ dữ liệu trên màn hình mà chưa cần làm gì cả lưu nó vào cache
+    // Add logic to apply the timer settings
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    uint8_t index_timer = atoi(text_index_timer);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    uint8_t idx_pin = atoi(text_index_pin);
+    if(index_timer > 0 && index_timer < 49)
+    {
+        if(idx_pin > 0 && idx_pin < 4)
+        {
+            //Đọc lưu dữ liệu trên màn hình
+            type_one_timer_contactors_t *timer = new type_one_timer_contactors_t;
+            timer->day_of_week.day_of_week[0] = lv_obj_has_state(objects.cb_sun, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[1] = lv_obj_has_state(objects.cb_mon, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[2] = lv_obj_has_state(objects.cb_tue, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[3] = lv_obj_has_state(objects.cb_wed, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[4] = lv_obj_has_state(objects.cb_thu, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[5] = lv_obj_has_state(objects.cb_fri, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[6] = lv_obj_has_state(objects.cb_sat, LV_STATE_CHECKED)?set_run:set_none;
+            timer->on_at.hour = atoi(lv_textarea_get_text(objects.txt_begin_hh));
+            timer->on_at.min = atoi(lv_textarea_get_text(objects.txt_begin_mm));
+            timer->off_at.hour = atoi(lv_textarea_get_text(objects.txt_end_hh));
+            timer->off_at.min = atoi(lv_textarea_get_text(objects.txt_end_mm));
+            const char *text_special_day = lv_textarea_get_text(objects.txt_string_special_day);
+            parse_special_day_string_to_struct(text_special_day, timer);
+            //Serial.printf("on_at: %02d:%02d, off_at: %02d:%02d\n", timer->on_at.hour, timer->on_at.min, timer->off_at.hour, timer->off_at.min);
+            //Serial.printf("day_of_week: %d %d %d %d %d %d %d\n", timer->day_of_week.day_of_week[0], timer->day_of_week.day_of_week[1], timer->day_of_week.day_of_week[2], timer->day_of_week.day_of_week[3], timer->day_of_week.day_of_week[4], timer->day_of_week.day_of_week[5], timer->day_of_week.day_of_week[6]);
+            //Serial.printf("special_day: ");
+           // for (uint8_t i = 0; i < MAX_NUM_SPECIAL_DAY; i++)
+           // {
+            //    Serial.printf("%d/%d ", timer->special_day[i].date, timer->special_day[i].month);
+            //}
+           // Serial.println();
+            const void *src = lv_img_get_src(objects.img_mode_active);
+            bool is_fix_time = false;
+            if (src == &img_mode_sun) {
+                is_fix_time = true;
+            }
+            //Serial.printf("is_fix_time: %s\n", is_fix_time ? "sun mode" : "Timer mode");
+            //Gửi lệnh lưu timer
+            
+            timer_copy_cache.mod_active = is_fix_time;
+            timer_copy_cache.timer_index.idx_pin = idx_pin - 1;
+            timer_copy_cache.timer_index.idx_timer = index_timer - 1;
+            timer_copy_cache.timer = *timer;
+        }
+    }
+ }
+void action_ev_pase_timer(lv_event_t *e) 
+{
+    // Add logic to pause the timer
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    uint8_t index_timer = atoi(text_index_timer);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    uint8_t idx_pin = atoi(text_index_pin);
+    if(index_timer > 0 && index_timer < 49)
+    {
+        if(idx_pin > 0 && idx_pin < 4)
+        {
+            //Gửi lệnh pause timer
+            timer_copy_cache.timer_index.idx_pin = idx_pin - 1;
+            timer_copy_cache.timer_index.idx_timer = index_timer - 1;
+           // hmi.send_struct(MSP_TIMER_PASTE, (uint8_t *)&cache_wb.timer_copy_cache, sizeof(type_apply_timer_t));
+            _callback(app_action_handle, MSP_TIMER_PASTE, (uint8_t *)&timer_copy_cache, sizeof(type_apply_timer_t));
+            //Serial.println("Pase timer action triggered");
+        }
+    }    
+}
+void action_ev_apply_timer(lv_event_t *e) 
+{
+        // Add logic to apply the timer settings
+    const char *text_index_timer = lv_label_get_text(objects.lbcnt_timer);
+    uint8_t index_timer = atoi(text_index_timer);
+    const char *text_index_pin = lv_label_get_text(objects.lbindex_pin_timer);
+    uint8_t idx_pin = atoi(text_index_pin);
+    if(index_timer > 0 && index_timer < 49)
+    {
+        if(idx_pin > 0 && idx_pin < 4)
+        {
+            //Đọc lưu dữ liệu trên màn hình
+            type_one_timer_contactors_t *timer = new type_one_timer_contactors_t;
+            timer->day_of_week.day_of_week[0] = lv_obj_has_state(objects.cb_sun, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[1] = lv_obj_has_state(objects.cb_mon, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[2] = lv_obj_has_state(objects.cb_tue, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[3] = lv_obj_has_state(objects.cb_wed, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[4] = lv_obj_has_state(objects.cb_thu, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[5] = lv_obj_has_state(objects.cb_fri, LV_STATE_CHECKED)?set_run:set_none;
+            timer->day_of_week.day_of_week[6] = lv_obj_has_state(objects.cb_sat, LV_STATE_CHECKED)?set_run:set_none;
+            timer->on_at.hour = atoi(lv_textarea_get_text(objects.txt_begin_hh));
+            timer->on_at.min = atoi(lv_textarea_get_text(objects.txt_begin_mm));
+            timer->off_at.hour = atoi(lv_textarea_get_text(objects.txt_end_hh));
+            timer->off_at.min = atoi(lv_textarea_get_text(objects.txt_end_mm));
+            const char *text_special_day = lv_textarea_get_text(objects.txt_string_special_day);
+            parse_special_day_string_to_struct(text_special_day, timer);
+           // Serial.printf("on_at: %02d:%02d, off_at: %02d:%02d\n", timer->on_at.hour, timer->on_at.min, timer->off_at.hour, timer->off_at.min);
+            //Serial.printf("day_of_week: %d %d %d %d %d %d %d\n", timer->day_of_week.day_of_week[0], timer->day_of_week.day_of_week[1], timer->day_of_week.day_of_week[2], timer->day_of_week.day_of_week[3], timer->day_of_week.day_of_week[4], timer->day_of_week.day_of_week[5], timer->day_of_week.day_of_week[6]);
+           // Serial.printf("special_day: ");
+            //for (uint8_t i = 0; i < MAX_NUM_SPECIAL_DAY; i++)
+            //{
+            //    Serial.printf("%d/%d ", timer->special_day[i].date, timer->special_day[i].month);
+            //}
+            //Serial.println();
+            const void *src = lv_img_get_src(objects.img_mode_active);
+            bool is_fix_time = false;
+            if (src == &img_mode_sun) {
+                is_fix_time = true;
+            }            
+            //Serial.printf("is_fix_time: %s\n", is_fix_time?"sun mode":"Timer mode");
+            //Gửi lệnh lưu timer
+            type_apply_timer_t apply_timer;
+            apply_timer.mod_active = is_fix_time;
+            apply_timer.timer_index.idx_pin = idx_pin - 1;
+            apply_timer.timer_index.idx_timer = index_timer - 1;
+            apply_timer.timer = *timer;
+            _callback(app_action_handle, MSP_TIMER_APPLY, (uint8_t *)&apply_timer, sizeof(type_apply_timer_t));
+           // hmi.send_struct(MSP_TIMER_APPLY, (uint8_t *)&apply_timer, sizeof(type_apply_timer_t));
+           // Serial.println("Apply timer action triggered");
+        }
+    }
+}
+void action_ev_save_timer(lv_event_t *e) {
+    _callback(app_action_handle, MSP_TIMER_SAVE, NULL, 0);
+}
+void action_act_pi_login(lv_event_t * e){
+
+    printf("action_act_pi_login\n");
+
+}
+void action_act_pi_forget_net(lv_event_t * e){
+    printf("action_act_pi_forget_net\n");
+
+}
+
+#pragma endregion

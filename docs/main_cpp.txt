@@ -1,0 +1,1251 @@
+#include "lvgl/lvgl.h"
+#include "lv_drivers/sdl/sdl.h"
+#include "lv_drivers/indev/evdev.h"
+#include <unistd.h>
+#include <SDL2/SDL.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <stdint.h>  // để dùng intptr_t
+#include "ui/ui.h"
+#include "ui/screens.h"
+#include "beep.h"
+#include "thread/tick.h"
+#include "thread/dim.h"
+#include "thread/serial.h"
+#include "thread/screen_monitor.h"
+#include "images.h"
+#include "common.h"
+#include "serial.h"
+#include "dim.h"
+
+#define DRAW_BUF_LINES 50 // Giảm buffer để tránh lỗi memory trên Pi Zero 2W
+
+extern volatile unsigned long idle_time_s;
+extern volatile bool is_dimmed;
+
+
+void update_pin_schedule_timer(type_one_timer_contactors_t *t);
+
+
+pthread_t screen_monitor_th;
+static app_serial_handle_t serial_handle = NULL;
+static app_handle_screen_t screen_handle = NULL;
+app_action_handle_t app_action_handle = NULL;
+app_dim_handle_t app_dim_handle = NULL;
+static lv_obj_t *screen_before = NULL;
+app_callback_t *callbackmain;
+extern evdev_device_t global_dsc;
+const char *modbus[] = {"---", "MFM383A", "MFM300"}; // 
+type_cache_flag_base_t cache_flag;
+
+// Hàm gọi ddcutil để set độ sáng về 100%
+static void reset_brightness()
+{
+    system("sudo ddcutil setvcp 10 100");
+    system("sudo ddcutil setvcp D6 1 --noverify");
+}
+
+// Xử lý khi Ctrl+C hoặc systemd gửi SIGTERM
+static void cleanup_handler(int sig)
+{
+    printf("\n[INFO] Received signal %d. Resetting brightness & exiting...\n", sig);
+    reset_brightness();
+    exit(0);
+}
+// Lấy SSID hiện tại mà thiết bị đang kết nối
+int get_current_ssid(char *ssid, size_t ssid_len) {
+    FILE *fp;
+    char line[256];
+    char command[128];
+    
+    // Lệnh để lấy SSID hiện tại
+    snprintf(command, sizeof(command), 
+        "iwgetid -r");
+    
+    fp = popen(command, "r");
+    if (fp == NULL) {
+        printf("[ERROR] Không thể lấy SSID\n");
+        return -1;
+    }
+    
+    if (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = 0; // Remove newline
+        if (strlen(line) > 0) {
+            strncpy(ssid, line, ssid_len - 1);
+            ssid[ssid_len - 1] = '\0';
+            pclose(fp);
+            return 0;
+        }
+    }
+    
+    pclose(fp);
+    return -1; // Không kết nối
+}
+
+// Lấy IP address hiện tại
+int get_current_ip(char *ip, size_t ip_len) {
+    FILE *fp;
+    char line[256];
+    char command[128];
+    
+    snprintf(command, sizeof(command), 
+        "ip addr show wlan0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1");
+    
+    fp = popen(command, "r");
+    if (fp == NULL) {
+        printf("[ERROR] Không thể lấy IP\n");
+        return -1;
+    }
+    
+    if (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) > 0) {
+            strncpy(ip, line, ip_len - 1);
+            ip[ip_len - 1] = '\0';
+            pclose(fp);
+            return 0;
+        }
+    }
+    
+    pclose(fp);
+    return -1;
+}
+
+
+
+
+int is_wifi_connected() {
+    char ssid[64];
+    return get_current_ssid(ssid, sizeof(ssid)) == 0;
+}
+
+
+
+void display_main_page_data(const type_display_main_page_t *data);
+
+void event_callback(int event_id, void *data, int data_len)
+{
+    switch (event_id)
+    {
+    case 1001:
+    {
+        if (data == NULL || data_len != sizeof(type_setting_rtc_t))
+        {
+            printf("[ERROR] Invalid data for 1001\n");
+            return;
+        }
+        type_setting_rtc_t *rtc = (type_setting_rtc_t *)data;
+        send_struct(serial_handle, MSP_SETTING_RTC, (uint8_t *)rtc, sizeof(type_setting_rtc_t));
+        printf("[MAIN] Send RTC setting\n");
+        break;
+
+    }
+    case 1002:
+    {
+        send_gps_get_location(serial_handle);
+        break;
+    }
+    case 1003:
+    {
+        if (data == NULL || data_len != sizeof(type_device_config_t))
+        {
+            printf("[ERROR] Invalid data for 1003\n");
+            return;
+        }
+        type_device_config_t *device_config = (type_device_config_t *)data;
+        send_struct(serial_handle, MSP_DEVICE_CONFIG, (uint8_t *)device_config, sizeof(type_device_config_t));
+        printf("[MAIN] Send device config\n");
+        break;
+    }
+    case 1004:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for 1004\n");
+            return;
+        }
+        uint8_t *gps_data = (uint8_t *)data;
+        send_byte(serial_handle, MSP_GPS_PAUSE, *gps_data);
+        break;
+    }
+    case 1005:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for 1005\n");
+            return;
+        }
+        type_wifi_info_t *wifi_data = (type_wifi_info_t *)data;
+        send_struct(serial_handle, MSP_NETWORK_CONNECT, (uint8_t *)wifi_data, sizeof(type_wifi_info_t));
+        break;
+    }
+
+    case 2000://Sự kiện thay đổi màn hình hiển thị từ screen
+    {
+        if (data == NULL || data_len != sizeof(enum ScreensEnum))
+        {
+            printf("[ERROR] Invalid data for MSP_DISPLAY_CHAGE_PAGE\n");
+            return;
+        }
+        enum ScreensEnum screen_id = *(enum ScreensEnum *)data;
+        usleep(5000); // 5ms để giảm tải CPU
+        send_cur_scereen(serial_handle, MSP_DISPLAY_CHAGE_PAGE, (uint8_t)screen_id);
+        if (screen_id == SCREEN_ID_SCHEDULE_PIN)
+        {
+            sleep(1); // 10ms để giảm tải CPU
+            type_timer_index_t timer_index;
+            timer_index.idx_pin = 0;
+            timer_index.idx_timer = 0;
+            send_struct(serial_handle, MSP_CHANGE_TIMER, (uint8_t *)&timer_index, sizeof(type_timer_index_t));
+            printf("[MAIN] Fist load timer-pin: %d-%d\n", timer_index.idx_timer, timer_index.idx_pin);
+        }
+        printf("[MAIN] Screen ID: %d\n", screen_id);
+        break;
+    }
+    case 2001:
+    {
+        printf("[MAIN] fist run\n");
+        printf("[MAIN] Send display sleep\n");
+        send_byte(serial_handle, MSP_DISPLAY_SLEEP, 0); // Gửi lệnh về cho msp để chuyển sang chế độ hoạt động
+        usleep(10000);
+        printf("[MAIN] Send get lock screen\n");
+        send_byte(serial_handle, MSP_DISPLAY_CHAGE_PAGE, SCREEN_ID_LOCK_SCREEN);
+        break;
+    }
+    case 5000:
+    {
+
+        
+        break;
+    }
+    case 5001:
+    {
+    
+        break;
+    }
+    case MSP_RTC_TIME:
+    {
+        if (data == NULL || data_len != sizeof(type_display_time_t))
+        {
+            printf("[ERROR] Invalid data for MSP_RTC_TIME\n");
+            return;
+        }
+
+        type_display_time_t *rtc_data = (type_display_time_t *)data;
+
+        const char *weekday_str[] = {
+            "CN", "T2", "T3", "T4", "T5", "T6", "T7"};
+
+        const char *day_str = "UKN";
+
+        if (rtc_data->day_of_week <= 6)
+            day_str = weekday_str[rtc_data->day_of_week];
+
+        char date_str[64]; // Tăng kích thước để chứa cả thứ
+        char time_str[64]; // Tăng kích thước để chứa cả thứ 
+        snprintf(date_str, sizeof(time_str), "%s - %02d/%02d/%04d",
+                 day_str,
+                 rtc_data->date, rtc_data->month, rtc_data->year);
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                 rtc_data->hour, rtc_data->minute, rtc_data->second);
+        if (objects.lbmainrtc)
+        {
+            lv_label_set_text(objects.lbmainrtc, date_str);
+            lv_label_set_text(objects.bl_time,time_str);
+        }
+        else
+        {
+            printf("[ERROR] lbmainrtc is NULL, label chưa tạo?\n");
+        }
+
+        break;
+    }
+    case MSP_DEVICE_STATUS:
+    {
+        if (data == NULL || data_len != sizeof(type_lock_page_t))
+        {
+            printf("[ERROR] Invalid data for MSP_DEVICE_STATUS\n");
+            return;
+        }
+        type_lock_page_t *lock_data = (type_lock_page_t *)data;
+        printf("[MAIN] Device status process: %d\n", lock_data->process);
+        lv_async_call([](void *p)
+        {
+            type_lock_page_t* st = static_cast<type_lock_page_t*>(p);
+
+            if (st->hardware)
+                lv_obj_add_state(objects.cbhardware, LV_STATE_CHECKED);
+            else
+                lv_obj_clear_state(objects.cbhardware, LV_STATE_CHECKED);
+
+            if (st->memory)
+                lv_obj_add_state(objects.cbmemory, LV_STATE_CHECKED);
+            else
+                lv_obj_clear_state(objects.cbmemory, LV_STATE_CHECKED);
+
+            if (st->rtc_gps)
+                lv_obj_add_state(objects.cbrtc, LV_STATE_CHECKED);
+            else
+                lv_obj_clear_state(objects.cbrtc, LV_STATE_CHECKED);
+
+            if (st->web_socket)
+                lv_obj_add_state(objects.cbcloud, LV_STATE_CHECKED);
+            else
+                lv_obj_clear_state(objects.cbcloud, LV_STATE_CHECKED);
+
+            if (st->wifi)
+                lv_obj_add_state(objects.cbwifi, LV_STATE_CHECKED);
+            else
+                lv_obj_clear_state(objects.cbwifi, LV_STATE_CHECKED);
+            // ✅ Thêm phần update progress bar
+            lv_bar_set_value(objects.pro_startup, st->process, LV_ANIM_OFF);
+            lv_textarea_set_text(objects.txt_console, st->msg);
+            delete st; }, new type_lock_page_t(*lock_data));
+        break;
+    }
+    case MSP_MAIN_DISPLAY_CHANGE:
+    {
+        if (data == NULL || data_len != sizeof(type_display_main_page_t))
+        {
+            printf("[ERROR] Invalid data for MSP_MAIN_DISPLAY_CHANGE\n");
+            return;
+        }
+        type_display_main_page_t *main_data = (type_display_main_page_t *)data;
+        //printf("[MAIN] Main display change: \n");
+        display_main_page_data(main_data);
+        break;
+    }
+    case MSP_SWICH_MANUAL_CONTROL:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+        }
+
+        uint8_t *manual_data = (uint8_t *)data;
+        send_manual_switch(serial_handle, *manual_data);
+        printf("[MAIN] Send manual switch: %d\n", *manual_data);
+        break;
+    }        
+    // Man hinh dieu khien
+    case MSP_PIN1_CONTACTOR:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for MSP_PIN1_CONTACTOR\n");
+            return;
+        }
+        uint8_t *contactor_data = (uint8_t *)data;
+        if (*contactor_data == 0x01)
+        {
+            printf("[MAIN] Phase A turned ON\n");
+            send_on_phase_a(serial_handle);
+        }
+        else
+        {
+            send_off_phase_a(serial_handle);
+        }
+        break;
+    }
+    case MSP_PIN2_CONTACTOR:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for MSP_PIN1_CONTACTOR\n");
+            return;
+        }
+        uint8_t *contactor_data = (uint8_t *)data;
+        if (*contactor_data == 0x01)
+        {
+            printf("[MAIN] Phase B turned ON\n");
+            send_on_phase_b(serial_handle);
+        }
+        else
+        {
+            send_off_phase_b(serial_handle);
+        }
+        break;
+    }
+    case MSP_PIN3_CONTACTOR:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for MSP_PIN1_CONTACTOR\n");
+            return;
+        }
+        uint8_t *contactor_data = (uint8_t *)data;
+        if (*contactor_data == 0x01)
+        {
+            printf("[MAIN] Phase C turned ON\n");
+            send_on_phase_c(serial_handle);
+        }
+        else
+        {
+            send_off_phase_c(serial_handle);
+        }
+        break;
+    }
+    case MSP_SETTING_RTC:
+    {
+        if (data == NULL || data_len != sizeof(type_setting_rtc_t))
+        {
+            printf("[ERROR] Invalid data for MSP_SETTING_RTC\n");
+            return;
+        }
+        type_setting_rtc_t *rtc = (type_setting_rtc_t *)data;
+        char buff_str[32];
+        snprintf(buff_str, sizeof(buff_str), "%02d", rtc->rtc_time.hour);
+        lv_textarea_set_text(objects.rtc_hour, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%02d", rtc->rtc_time.minute);
+        lv_textarea_set_text(objects.rtc_min, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%02d", rtc->rtc_time.second);
+        lv_textarea_set_text(objects.rtc_sec, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%02d", rtc->rtc_time.date);
+        lv_textarea_set_text(objects.rtc_date, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%02d", rtc->rtc_time.month);
+        lv_textarea_set_text(objects.rtc_month, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%04d", rtc->rtc_time.year);
+        lv_textarea_set_text(objects.rtc_year, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%0.4f", rtc->dev_coordinate.latitude);
+        lv_label_set_text(objects.txt_latitude, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%0.4f", rtc->dev_coordinate.longitude);
+        lv_label_set_text(objects.txt_logitude, buff_str);
+        if (rtc->gps_auto_run)
+        {
+                lv_obj_add_state(objects.choise_gpsauto_run, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.choise_gpsauto_run, LV_STATE_CHECKED);
+        }
+        break;
+    }
+
+    case MSP_DEVICE_CONFIG:
+    {
+        if (data == NULL || data_len != sizeof(type_device_config_t))
+        {
+            printf("[ERROR] Invalid data for MSP_DEVICE_CONFIG\n");
+            return;
+        }
+        type_device_config_t *dev = (type_device_config_t *)data;
+
+        char buff_str[32];
+        if (dev->input[0])
+        {
+                lv_obj_add_state(objects.sw_en_io, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_en_io, LV_STATE_CHECKED);
+        }
+        if (dev->input[1])
+        {
+                lv_obj_add_state(objects.sw_en_am, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_en_am, LV_STATE_CHECKED);
+        }
+        if (dev->output[0])
+        {
+                lv_obj_add_state(objects.sw_en_ouput_a, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_en_ouput_a, LV_STATE_CHECKED);
+        }
+        if (dev->output[1])
+        {
+                lv_obj_add_state(objects.sw_en_ouput_b, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_en_ouput_b, LV_STATE_CHECKED);
+        }
+        if (dev->output[2])
+        {
+                lv_obj_add_state(objects.sw_en_ouput_c, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_en_ouput_c, LV_STATE_CHECKED);
+        }
+        if (dev->modbus_model != 0)
+        {
+                lv_obj_add_state(objects.sw_modbus_enable, LV_STATE_CHECKED);
+                if (dev->modbus_model > 0 && dev->modbus_model < 3)
+                {
+                        lv_textarea_set_text(objects.txttypemodbus, modbus[dev->modbus_model]);
+                }
+                else
+                {
+                        lv_textarea_set_text(objects.txttypemodbus, modbus[0]);
+                }
+                snprintf(buff_str, sizeof(buff_str), "%d", dev->modbus_baudrate);
+                lv_textarea_set_text(objects.txtbaudmodbus, buff_str);
+                snprintf(buff_str, sizeof(buff_str), "%d", dev->modbus_Slave_add);
+                lv_textarea_set_text(objects.txtaddmodbus, buff_str);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_modbus_enable, LV_STATE_CHECKED);
+        }
+        break;
+    }
+    case MSP_DEVICE_HARDWARE_ID:
+    {
+        if (data == NULL || data_len != sizeof(char) * 32)
+        {
+            printf("[ERROR] Invalid data for MSP_DEVICE_HARDWARE_ID\n");
+            return;
+        }
+        char *esp_id = (char *)data;
+        lv_label_set_text(objects.txtdevice_id, esp_id);
+        // Sử dụng:
+        if(!is_wifi_connected())
+        {
+            lv_label_set_text(objects.lb_pi_net_status, "Disconnected");
+            lv_label_set_text(objects.lbdis_ip, "0.0.0.0");
+        }else
+        {
+            lv_label_set_text(objects.lb_pi_net_status, "Connected");
+            char ip[64];
+            if(get_current_ip(ip, sizeof(ip)) == 0)
+            {
+                printf("Raspberry Pi IP: %s\n", ip);
+                lv_label_set_text(objects.lbdis_ip, ip);
+            }else
+            {
+                lv_label_set_text(objects.lbdis_ip, "0.0.0.0");
+            }
+
+            char ssid[64];
+            if (get_current_ssid(ssid, sizeof(ssid)) == 0) {
+                lv_textarea_set_text(objects.txt_pi_ssid, ssid);
+            }else
+            {
+                lv_textarea_set_text(objects.txt_pi_ssid, "");
+            }
+        }
+
+        break;
+    }
+    case MSP_NETWORK_INFO:
+    {
+        if (data == NULL || data_len != sizeof(type_network_setting_t))
+        {
+            printf("[ERROR] Invalid data for MSP_NETWORK_INFO\n");
+            return;
+        }
+        type_network_setting_t *net = (type_network_setting_t *)data;
+        char buff_ssid[32];
+        char buff_pw[32];
+        char buff_str[32];
+        usleep(10000);
+        // SSID
+        if (strlen(net->ssid) > 0)
+        {
+                snprintf(buff_ssid, sizeof(buff_ssid), "%s", net->ssid);
+                lv_textarea_set_text(objects.txt_ssid, buff_ssid);
+        }
+
+        // Password
+        if (strlen(net->password) > 0)
+        {
+                snprintf(buff_pw, sizeof(buff_pw), "%s", net->password);
+                lv_textarea_set_text(objects.txtpassword, buff_pw);
+        }
+
+        // Enable WiFi
+        if (net->enable_wifi)
+        {
+                lv_obj_add_state(objects.sw_enable_wifi, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_enable_wifi, LV_STATE_CHECKED);
+        }
+
+        // Enable Cloud
+        if (net->enable_cloud)
+        {
+                lv_obj_add_state(objects.sw_cloud_enable, LV_STATE_CHECKED);
+        }
+        else
+        {
+                lv_obj_clear_state(objects.sw_cloud_enable, LV_STATE_CHECKED);
+        }
+
+        // IP
+        if (strlen(net->ip) > 0)
+        {
+                snprintf(buff_str, sizeof(buff_str), "%s", net->ip);
+                lv_label_set_text(objects.lb_ip_add, buff_str);
+        }
+
+        // Mask
+        if (strlen(net->mask) > 0)
+        {
+                snprintf(buff_str, sizeof(buff_str), "%s", net->mask);
+                lv_label_set_text(objects.lb_ip_mask, buff_str);
+        }
+
+        // Gateway (⚠️ dùng sai định dạng ở bản trước)
+        if (strlen(net->gateway) > 0)
+        {
+                snprintf(buff_str, sizeof(buff_str), "%s", net->gateway);
+                lv_label_set_text(objects.lb_ip_gateway, buff_str);
+        }
+        if (net->wifi_status == 1)
+        {
+                lv_label_set_text(objects.lb_wfi_status, "Kết nối thành công");
+        }
+        else
+        {
+                lv_label_set_text(objects.lb_wfi_status, "Kết nối thất bại");
+        }
+        if (net->cloud_status == 1)
+        {
+                lv_label_set_text(objects.lb_cloud_status, "Kết nối");
+        }
+        else
+        {
+                lv_label_set_text(objects.lb_cloud_status, "Ngắt kết nối");
+        }
+        break;
+    }
+    case MSP_TIMER_APPLY:
+    {
+        if (data == NULL || data_len != sizeof(type_apply_timer_t))
+        {
+            printf("[ERROR] Invalid data for MSP_TIMER_APPLY\n");
+            return;
+        }
+        type_apply_timer_t *apply_timer = (type_apply_timer_t *)data;
+        send_struct(serial_handle, MSP_TIMER_APPLY, (uint8_t *)apply_timer, sizeof(type_apply_timer_t));
+        break;
+    }
+    case MSP_TIMER_PASTE:
+    {
+        if (data == NULL || data_len != sizeof(type_apply_timer_t))
+        {
+            printf("[ERROR] Invalid data for MSP_TIMER_PASTE\n");
+            return;
+        }
+        type_apply_timer_t *apply_timer = (type_apply_timer_t *)data;
+        send_struct(serial_handle, MSP_TIMER_PASTE, (uint8_t *)apply_timer, sizeof(type_apply_timer_t));
+        break;
+    }
+    case MSP_TIMER_SAVE:
+    {
+       send_byte(serial_handle, MSP_TIMER_SAVE, 0x01);
+       break;
+    }
+    case MSP_TIMER_CLEAR:
+    {
+        if (data == NULL || data_len != sizeof(type_timer_index_t))
+        {
+            printf("[ERROR] Invalid data for MSP_TIMER_CLEAR\n");
+            return;
+        }
+        type_timer_index_t *timer_index = (type_timer_index_t *)data;
+        send_struct(serial_handle, MSP_TIMER_CLEAR, (uint8_t *)timer_index, sizeof(type_timer_index_t));
+        break;
+    }
+    case MSP_CHANGE_TIMER:
+    {
+        if (data == NULL || data_len != sizeof(type_timer_index_t))
+        {
+            printf("[ERROR] Invalid data for MSP_CHANGE_TIMER\n");
+            return;
+        }
+        type_timer_index_t *timer_index = (type_timer_index_t *)data;
+        send_struct(serial_handle, MSP_CHANGE_TIMER, (uint8_t *)timer_index, sizeof(type_timer_index_t));
+        printf("Change timer index: %d\n", timer_index->idx_timer);
+        printf("Change pin index: %d\n", timer_index->idx_pin);
+        break;
+    }
+    case MSP_TIMER_DATA:
+    {
+        if (data == NULL || data_len != sizeof(type_apply_timer_t))
+        {
+            printf("[ERROR] Invalid data for MSP_TIMER_DATA\n");
+            return;
+        }
+        type_apply_timer_t *apply_timer = (type_apply_timer_t *)data;
+        // B1:Lấy chỉ số pin và timer từ label
+        const char *text_pin_schedule = lv_label_get_text(objects.lbindex_pin_timer);
+        uint8_t index_pin = atoi(text_pin_schedule);
+        const char *text_timer_schedule = lv_label_get_text(objects.lbcnt_timer);
+        uint8_t index_timer = atoi(text_timer_schedule);
+        printf("Display index_pin = %d, index_timer = %d\n", index_pin, index_timer);
+        if (index_pin <= 3 && index_timer <= 48)
+        {
+            type_one_timer_contactors_t *timer = new type_one_timer_contactors_t;
+            *timer = apply_timer->timer;
+            if (apply_timer->mod_active == fix_time)
+            {
+                lv_img_set_src(objects.img_mode_active, &img_mode_timer);
+            }
+            else
+            {
+                lv_img_set_src(objects.img_mode_active, &img_mode_sun);
+            }
+            lv_async_call([](void *p)
+                          {
+                                                type_one_timer_contactors_t* st = static_cast<type_one_timer_contactors_t*>(p);
+                                                update_pin_schedule_timer(st);
+                                                //Gọi hàm
+                                  delete st; }, timer);
+        }
+        else
+        {
+            index_pin = 0;
+            index_timer = 0;
+        }
+        break;
+    }
+    case MSP_DETAIL_PIN_SCHEDULE:
+    {
+        if (data == NULL || data_len != sizeof(type_timer_info_detail_t))
+        {
+            printf("[ERROR] Invalid data for MSP_DETAIL_PIN_SCHEDULE\n");
+            return;
+        }
+        type_timer_info_detail_t *timer = (type_timer_info_detail_t *)data;
+        char buff_str[32];
+        snprintf(buff_str, sizeof(buff_str), "%02d", timer->num_timer_set);
+        lv_label_set_text(objects.lb_num_timer_run, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%02d", timer->num_special_day_set);
+        lv_label_set_text(objects.lb_num_special_day, buff_str);
+    break;
+    }
+    case MSP_DISPLAY_SLEEP:
+    {
+        if (data == NULL || data_len != sizeof(uint8_t))
+        {
+            printf("[ERROR] Invalid data for MSP_DISPLAY_SLEEP\n");
+            return;
+        }
+        
+        // Thêm kiểm tra serial_handle
+        if (serial_handle == NULL)
+        {
+            printf("[ERROR] serial_handle is NULL\n");
+            return;
+        }
+        
+        uint8_t *sleep_data = (uint8_t *)data;
+        send_byte(serial_handle, MSP_DISPLAY_SLEEP, *sleep_data);
+        printf("[MAIN] Send display sleep command %d\n", *sleep_data);
+        
+        if(*sleep_data == 0)
+        {
+            // Thêm kiểm tra trước khi gọi
+            if (serial_handle != NULL)
+            {
+                send_byte(serial_handle, MSP_DISPLAY_CHAGE_PAGE, (uint8_t)(SCREEN_ID_LOCK_SCREEN));
+                printf("[MAIN] send_cur_scereen %d\n", SCREEN_ID_LOCK_SCREEN);
+            }
+            else
+            {
+                printf("[ERROR] serial_handle is NULL when calling send_cur_scereen\n");
+            }
+        }
+        break;
+    }
+    case MSP_DEVICE_ACTIVE:
+    {
+
+        send_byte(serial_handle, MSP_DEVICE_ACTIVE, 0x01);
+        printf("[MAIN] Send device active command %d\n", 0x01);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+
+void startUp_memory_config(void)
+{
+    memset((bool *)&cache_flag, false, sizeof(type_cache_flag_base_t));
+}
+
+void segfault_handler(int sig) {
+    void *array[10];
+    size_t size;
+    
+    size = backtrace(array, 10);
+    
+    printf("\n[SEGFAULT] ==========================================\n");
+    printf("[SEGFAULT] Signal %d received!\n", sig);
+    printf("[SEGFAULT] Stack trace:\n");
+    
+    for (int i = 0; i < size; i++) {
+        Dl_info info;
+        if (dladdr(array[i], &info)) {
+            printf("[SEGFAULT] %d: %s (%s) [%p]\n", 
+                   i, info.dli_sname, info.dli_fname, array[i]);
+        } else {
+            printf("[SEGFAULT] %d: [%p]\n", i, array[i]);
+        }
+    }
+    
+    printf("[SEGFAULT] ==========================================\n");
+    exit(1);
+}
+
+int main(void)
+{
+    //Khai báo biến toàn cục
+    callbackmain = &event_callback;
+    //putenv("SDL_AUDIODRIVER=alsa");
+    // Đăng ký signal handler
+    signal(SIGSEGV, segfault_handler);
+    signal(SIGABRT, segfault_handler);
+    // Gán signal handler cho Ctrl+C và systemd stop
+    signal(SIGINT, cleanup_handler);
+    signal(SIGTERM, cleanup_handler);
+
+    // Đảm bảo màn hình sáng khi khởi động
+    reset_brightness();
+    beep_init();
+    //Gán callback cho uart nhận dữ liệu và callback xử lý sự kiện
+    app_serial_config_t app_serial_config = {
+        .callback = &event_callback,
+    };
+    sleep(3);
+    serial_handle = serial_init(&app_serial_config);
+    sleep(2);
+    app_network_start(serial_handle);
+
+
+    // Tạo các thread cho tick lvgl, dim màn hình và UART
+    pthread_t tick_th, tick_backlight;
+    pthread_create(&tick_th, NULL, tick_thread, NULL);
+    pthread_create(&tick_backlight, NULL, tick_dim, NULL);
+  
+
+
+    //Xử lý các sự kiên liên quan đến màn hình chủ động từ phía màn hình
+    app_screen_config_t app_screen_config = {
+        .callback = &event_callback,
+    };
+    screen_handle = screen_monitor_init(&app_screen_config);
+    screen_monitor_start(screen_handle);
+    //Xử lý các lệnh điều khiển từ app
+    app_action_config_t app_action_config = {
+        .callback = &event_callback,
+    };
+    app_action_handle = app_action_init(&app_action_config);
+    //Khởi tạo callback cho dim
+    dim_app_config_t app_dim_config = {
+        .callback = &event_callback,
+    };
+    app_dim_handle = app_dim_init(&app_dim_config);
+    lv_init();
+    sdl_init();
+    SDL_ShowCursor(SDL_DISABLE);
+
+    // Cấu hình LVGL display driver
+    static lv_disp_draw_buf_t draw_buf;
+    static lv_color_t buf1[1920 * DRAW_BUF_LINES];
+    static lv_color_t buf2[1920 * DRAW_BUF_LINES];
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, 1920 * DRAW_BUF_LINES);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.flush_cb = sdl_display_flush;
+    disp_drv.draw_buf = &draw_buf;
+    disp_drv.hor_res = 1920;
+    disp_drv.ver_res = 1080;
+
+    lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+    if (!disp)
+    {
+        printf("[ERROR] Không thể đăng ký display driver!\n");
+        return -1;
+    }
+
+    // Input (cảm ứng) dùng evdev
+    evdev_init();
+    evdev_device_set_calibration(&global_dsc, 87, 1, 9339, 16275); // ver_min, hor_min, ver_max, hor_max
+
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = evdev_read;
+    indev_drv.user_data = &global_dsc;
+    indev_drv.disp = disp;
+
+    lv_indev_t *indev = lv_indev_drv_register(&indev_drv);
+    if (!indev)
+    {
+        printf("[ERROR] Không thể đăng ký input driver!\n");
+        return -1;
+    }
+
+    // Khởi tạo giao diện chính
+    ui_init();
+
+    
+    // Vòng lặp xử lý giao diện
+    while (1)
+    {
+        lv_timer_handler();
+        ui_tick();
+        usleep(5000); // ~200 FPS, đủ mượt cho LVGL
+    }
+
+    return 0;
+}
+
+
+
+
+
+
+
+void display_main_page_data(const type_display_main_page_t *data)
+{
+    char buff_str[48];
+    uint8_t out_put_set = 0;
+    snprintf(buff_str, sizeof(buff_str), "%02d:%02d:%02d-%02d/%02d/%04d",
+             data->time_active.hour, data->time_active.minute, data->time_active.second,
+             data->time_active.date, data->time_active.month, data->time_active.year);
+    lv_label_set_text(objects.txt_time_active, buff_str);
+    snprintf(buff_str, sizeof(buff_str), "%08lu [m]", data->time_cpu_run);
+    lv_label_set_text(objects.txt_runtime, buff_str);
+    if (data->gps_codinate_gps.latitude == 0 && data->gps_codinate_gps.longitude == 0)
+    {
+        lv_label_set_text(objects.txtlatgi, "00.0000");
+        lv_label_set_text(objects.txtlongi, "000.0000");
+    }
+    else
+    {
+        snprintf(buff_str, sizeof(buff_str), "%.4f", data->gps_codinate_gps.latitude);
+        lv_label_set_text(objects.txtlatgi, buff_str);
+        snprintf(buff_str, sizeof(buff_str), "%.4f", data->gps_codinate_gps.longitude);
+        lv_label_set_text(objects.txtlongi, buff_str);
+    }
+
+    snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->sunrise.hour, data->sunrise.min);
+    lv_label_set_text(objects.txtsunrise, buff_str);
+    snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->sunset.hour, data->sunset.min);
+    lv_label_set_text(objects.txtsunset, buff_str);
+
+    if (data->pin_on_at[0].hour != set_time_none && data->pin_on_at[0].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_on_at[0].hour, data->pin_on_at[0].min);
+        lv_label_set_text(objects.txt_onat1, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_onat1, "88:88");
+    }
+    if (data->pin_on_at[1].hour != set_time_none && data->pin_on_at[1].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_on_at[1].hour, data->pin_on_at[1].min);
+        lv_label_set_text(objects.txt_onat2, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_onat2, "88:88");
+    }
+    if (data->pin_on_at[2].hour != set_time_none && data->pin_on_at[2].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_on_at[2].hour, data->pin_on_at[2].min);
+        lv_label_set_text(objects.txt_onat3, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_onat3, "88:88");
+    }
+    if (data->pin_off_at[0].hour != set_time_none && data->pin_off_at[0].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_off_at[0].hour, data->pin_off_at[0].min);
+        lv_label_set_text(objects.txt_offat1, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_offat1, "88:88");
+    }
+    if (data->pin_off_at[1].hour != set_time_none && data->pin_off_at[1].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_off_at[1].hour, data->pin_off_at[1].min);
+        lv_label_set_text(objects.txt_offat2, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_offat2, "88:88");
+    }
+    if (data->pin_off_at[2].hour != set_time_none && data->pin_off_at[2].min != set_time_none)
+    {
+        snprintf(buff_str, sizeof(buff_str), "%02d:%02d", data->pin_off_at[2].hour, data->pin_off_at[2].min);
+        lv_label_set_text(objects.txt_offat3, buff_str);
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_offat3, "88:88");
+    }
+
+    if (data->output_state[0])
+    {
+
+        lv_img_set_src(objects.btn_manual_a, &img_active_switch);
+        lv_obj_invalidate(objects.btn_manual_a);
+        out_put_set += 1;
+
+    }
+    else
+    {
+        lv_img_set_src(objects.btn_manual_a, &img_deactive_switch);
+        lv_obj_invalidate(objects.btn_manual_a);
+
+    }
+
+    if (data->output_state[1])
+    {
+        lv_img_set_src(objects.btn_manual_b, &img_active_switch);
+        lv_obj_invalidate(objects.btn_manual_b);
+        out_put_set += 1;
+
+    }
+    else
+    {
+        lv_img_set_src(objects.btn_manual_b, &img_deactive_switch);
+        lv_obj_invalidate(objects.btn_manual_b);
+
+    }
+    if (data->output_state[2])
+    {
+        lv_img_set_src(objects.btn_manual_c, &img_active_switch);
+        lv_obj_invalidate(objects.btn_manual_c);
+        out_put_set += 1;
+
+    }
+    else
+    {
+        lv_img_set_src(objects.btn_manual_c, &img_deactive_switch);
+        lv_obj_invalidate(objects.btn_manual_c);
+
+    }
+    snprintf(buff_str, sizeof(buff_str), "CÓ %02d NGÕ RA HĐ", out_put_set);
+    lv_label_set_text(objects.lb_status_input, buff_str);//txt_device_run_starus
+    if(out_put_set == 1)
+    {
+        lv_bar_set_value(objects.bar_act, 35, LV_ANIM_OFF);
+    }else     if(out_put_set == 2)
+    {
+        lv_bar_set_value(objects.bar_act, 70, LV_ANIM_OFF);
+    }else     if(out_put_set == 3)
+    {
+        lv_bar_set_value(objects.bar_act, 100, LV_ANIM_OFF);
+    }else
+    {
+        lv_bar_set_value(objects.bar_act, 0, LV_ANIM_OFF); 
+    }
+    if (data->switch_io == switch_on)
+    {
+        if (data->switch_auto_manual == switch_auto)
+        {
+            lv_label_set_text(objects.txt_device_run_starus, "Auto");
+            lv_obj_set_style_arc_color(objects.spin_oa_1, lv_color_hex(0x00e900), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        }
+        else
+        {
+            lv_label_set_text(objects.txt_device_run_starus, "Manu");//#f24609
+            lv_obj_set_style_arc_color(objects.spin_oa_1, lv_color_hex(0xf24609), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        }
+    }
+    else
+    {
+        lv_label_set_text(objects.txt_device_run_starus, "Off");//505650
+        lv_obj_set_style_arc_color(objects.spin_oa_1, lv_color_hex(0x505650), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    }
+    if (data->modbus_status != 0 && data->modbus_status < 3)
+    {
+        lv_label_set_text(objects.lb_modbus_status, modbus[data->modbus_status]);
+
+
+        //Volt A
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fvoltage[0]);
+        lv_bar_set_value(objects.bar_volt_a, (uint16_t)data->fvoltage[0], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pa_volt, buff_str);
+        //Ampe A
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fcurrent[0]);
+        lv_bar_set_value(objects.bar_amp_a, (uint16_t)data->fcurrent[0], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pa_ampe, buff_str);
+        //Power A
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fpower[0]);
+        lv_bar_set_value(objects.bar_power_a, (uint16_t)data->fpower[0], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pa_power, buff_str);
+        //Power factor A
+        snprintf(buff_str, sizeof(buff_str), "%0.2f", data->fpf[0]);
+        lv_label_set_text(objects.txt_pa_pf, buff_str);
+        //Volt B
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fvoltage[1]);
+        lv_bar_set_value(objects.bar_volt_b, (uint16_t)data->fvoltage[1], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pb_volt, buff_str);
+        //Ampe B
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fcurrent[1]);
+        lv_bar_set_value(objects.bar_amp_b, (uint16_t)data->fcurrent[1], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pb_ampe, buff_str);
+        //Power B
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fpower[1]);
+        lv_bar_set_value(objects.bar_power_b, (uint16_t)data->fpower[1], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pb_power, buff_str);
+        //Power factor B
+        snprintf(buff_str, sizeof(buff_str), "%0.2f", data->fpf[1]);
+        lv_label_set_text(objects.txt_pb_pf, buff_str);
+        //Volt C
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fvoltage[2]);
+        lv_bar_set_value(objects.bar_volt_c, (uint16_t)data->fvoltage[2], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pc_volt, buff_str);
+        //Ampe C
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fcurrent[2]);
+        lv_bar_set_value(objects.bar_amp_c, (uint16_t)data->fcurrent[2], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pc_ampe, buff_str);
+        //Power C
+        snprintf(buff_str, sizeof(buff_str), "%d", (uint16_t)data->fpower[2]);
+        lv_bar_set_value(objects.bar_power_c, (uint16_t)data->fpower[2], LV_ANIM_OFF);
+        lv_label_set_text(objects.txt_pc_power, buff_str);
+        //Power factor C
+        snprintf(buff_str, sizeof(buff_str), "%0.2f", data->fpf[2]);
+        lv_label_set_text(objects.txt_pc_pf, buff_str);
+    }
+    else
+    {
+
+        lv_label_set_text(objects.lb_modbus_status, "NGẮT KẾT NỐI");
+
+        lv_label_set_text(objects.txt_pa_volt, "000");//VoltA
+        lv_label_set_text(objects.txt_pa_power, "000");//Power A
+        lv_label_set_text(objects.txt_pa_pf, "0.00");//Power factor A
+        lv_label_set_text(objects.txt_pa_ampe, "000");//Ampe A
+
+        lv_bar_set_value(objects.bar_volt_a, 0, LV_ANIM_OFF);//VoltA                
+        lv_bar_set_value(objects.bar_amp_a, 0, LV_ANIM_OFF);//Ampe A bar_amp_a               
+        lv_bar_set_value(objects.bar_power_a, 0, LV_ANIM_OFF);//Power A
+       
+
+        lv_label_set_text(objects.txt_pb_volt, "000");//Volt B
+        lv_label_set_text(objects.txt_pb_ampe, "000");//Ampe B
+        lv_label_set_text(objects.txt_pb_power, "000");//power B
+        lv_label_set_text(objects.txt_pb_pf, "0.00");//Power factor B
+
+        lv_bar_set_value(objects.bar_volt_b, 0, LV_ANIM_OFF);//Volt B                 
+        lv_bar_set_value(objects.bar_amp_b, 0, LV_ANIM_OFF);//Ampe B                
+        lv_bar_set_value(objects.bar_power_b, 0, LV_ANIM_OFF);//power B
+
+
+
+        lv_label_set_text(objects.txt_pc_volt, "000");//Volt C
+        lv_label_set_text(objects.txt_pc_ampe, "000");//Ampe C
+        lv_label_set_text(objects.txt_pc_power, "000");//Power C
+        lv_label_set_text(objects.txt_pc_pf, "0.00");//Power factor C
+
+        lv_bar_set_value(objects.bar_volt_c, 0, LV_ANIM_OFF);                
+        lv_bar_set_value(objects.bar_amp_c, 0, LV_ANIM_OFF);                
+        lv_bar_set_value(objects.bar_power_c, 0, LV_ANIM_OFF);
+        
+    }
+}
+
+
+
+void update_pin_schedule_timer(type_one_timer_contactors_t *t)
+{
+        // ----- Hiển thị thời gian bật / tắt -----
+        char time_str[8];
+        if (t == nullptr)
+                return;
+        if (t->on_at.hour < 24 && t->on_at.min < 60 && t->off_at.hour < 24 && t->off_at.min < 60)
+        {
+                snprintf(time_str, sizeof(time_str), "%02d", t->on_at.hour);
+                lv_textarea_set_text(objects.txt_begin_hh, time_str);
+
+                snprintf(time_str, sizeof(time_str), "%02d", t->on_at.min);
+                lv_textarea_set_text(objects.txt_begin_mm, time_str);
+
+                snprintf(time_str, sizeof(time_str), "%02d", t->off_at.hour);
+                lv_textarea_set_text(objects.txt_end_hh, time_str);
+
+                snprintf(time_str, sizeof(time_str), "%02d", t->off_at.min);
+                lv_textarea_set_text(objects.txt_end_mm, time_str);
+        }
+        else
+        {
+
+                lv_textarea_set_text(objects.txt_begin_hh, "");
+                lv_textarea_set_text(objects.txt_begin_mm, "");
+                lv_textarea_set_text(objects.txt_end_hh, "");
+                lv_textarea_set_text(objects.txt_end_mm, "");
+        }
+
+        (t->day_of_week.day_of_week[0] == set_run)
+            ? lv_obj_add_state(objects.cb_sun, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_sun, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[1] == set_run)
+            ? lv_obj_add_state(objects.cb_mon, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_mon, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[2] == set_run)
+            ? lv_obj_add_state(objects.cb_tue, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_tue, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[3] == set_run)
+            ? lv_obj_add_state(objects.cb_wed, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_wed, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[4] == set_run)
+            ? lv_obj_add_state(objects.cb_thu, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_thu, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[5] == set_run)
+            ? lv_obj_add_state(objects.cb_fri, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_fri, LV_STATE_CHECKED);
+        (t->day_of_week.day_of_week[6] == set_run)
+            ? lv_obj_add_state(objects.cb_sat, LV_STATE_CHECKED)
+            : lv_obj_clear_state(objects.cb_sat, LV_STATE_CHECKED);
+        // ----- Ghép chuỗi ngày đặc biệt -----
+        char special_str[128] = {0};
+        char *ptr = special_str;
+        bool has_valid_special_day = false;
+
+        for (uint8_t i = 0; i < MAX_NUM_SPECIAL_DAY; i++)
+        {
+                uint8_t d = t->special_day[i].date;
+                uint8_t m = t->special_day[i].month;
+
+                // Nếu là 0/0 → không quan tâm
+                if (d == 0 && m == 0)
+                        continue;
+
+                has_valid_special_day = true;
+
+                int n = snprintf(ptr, sizeof(special_str) - (ptr - special_str), "%d/%d;", d, m);
+                if (n <= 0 || (ptr - special_str + n) >= sizeof(special_str))
+                        break;
+                ptr += n;
+        }
+
+        // Nếu có dữ liệu → xoá dấu `;` cuối
+        size_t len = strlen(special_str);
+        if (len > 0 && special_str[len - 1] == ';')
+        {
+                special_str[len - 1] = '\0';
+        }
+
+        // ----- Gán vào label hoặc xoá nếu không có ngày đặc biệt -----
+        if (has_valid_special_day)
+        {
+                lv_textarea_set_text(objects.txt_string_special_day, special_str);
+        }
+        else
+        {
+                // Không có ngày đặc biệt → xoá nội dung cũ
+                lv_textarea_set_text(objects.txt_string_special_day, "");
+        }
+}
