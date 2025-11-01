@@ -25,8 +25,41 @@ add_subdirectory(lvgl)
 
 if (CONFIG_LV_USE_EVDEV)
     message("Including EVDEV support")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(EVDEV REQUIRED libevdev)
+    # Try pkg-config first (if available), then fall back to manual detection in sysroot
+    find_package(PkgConfig)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(EVDEV libevdev)
+    endif()
+
+    if (NOT EVDEV_FOUND)
+        # Fallback: locate headers and library directly in the sysroot
+        set(_EVDEV_HINT_INC
+            ${CMAKE_SYSROOT}/usr/include/libevdev-1.0
+            ${CMAKE_SYSROOT}/usr/local/include
+            ${CMAKE_SYSROOT}/usr/include)
+        set(_EVDEV_HINT_LIB
+            ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
+            ${CMAKE_SYSROOT}/usr/local/lib
+            ${CMAKE_SYSROOT}/usr/lib)
+
+        find_path(EVDEV_INCLUDE_DIR
+            NAMES libevdev/libevdev.h
+            HINTS ${_EVDEV_HINT_INC}
+            NO_DEFAULT_PATH)
+
+        find_library(EVDEV_LIBRARY
+            NAMES evdev libevdev
+            HINTS ${_EVDEV_HINT_LIB}
+            NO_DEFAULT_PATH)
+
+        if (EVDEV_INCLUDE_DIR AND EVDEV_LIBRARY)
+            set(EVDEV_LIBRARIES ${EVDEV_LIBRARY})
+            set(EVDEV_INCLUDE_DIRS ${EVDEV_INCLUDE_DIR})
+            set(EVDEV_FOUND TRUE)
+        else()
+            message(FATAL_ERROR "libevdev not found via pkg-config nor in sysroot at ${CMAKE_SYSROOT}. Please install libevdev into the sysroot or adjust paths.")
+        endif()
+    endif()
 
     list(APPEND PKG_CONFIG_LIB ${EVDEV_LIBRARIES})
     list(APPEND PKG_CONFIG_INC ${EVDEV_INCLUDE_DIRS})

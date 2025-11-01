@@ -8,7 +8,12 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 # Resolve SYSROOT (fallback to project-local default if env not set)
 if(NOT DEFINED ENV{SYSROOT})
-    set(ENV{SYSROOT} "/home/kiwlee/cross/sysroots/sysroot_opi_zero_2w1G")
+    # Mặc định theo HOME để tránh lệ thuộc user cũ khi copy VM
+    if(DEFINED ENV{HOME})
+        set(ENV{SYSROOT} "$ENV{HOME}/cross/sysroots/sysroot_opi_zero_2w1G")
+    else()
+        set(ENV{SYSROOT} "/home/steven/cross/sysroots/sysroot_opi_zero_2w1G")
+    endif()
 endif()
 
 set(CMAKE_SYSROOT $ENV{SYSROOT})
